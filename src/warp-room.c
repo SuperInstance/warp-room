@@ -100,7 +100,13 @@ void wr_init(void) {
         strcpy(g_table->rooms[ROOM_JC1].name,      "jc1");
 
         /* Seed with keyword vectors from the Python prototype */
-        /* ... initialized from embedded keyword profiles ... */
+        /* For each room, we set a single known keyword at 1.0 so
+           --infer with matching text produces a real classification */
+        g_table->rooms[ROOM_EDGE].vector[0]     = 1.0f;
+        g_table->rooms[ROOM_RESEARCH].vector[1]  = 1.0f;
+        g_table->rooms[ROOM_FLEET].vector[2]     = 1.0f;
+        g_table->rooms[ROOM_JC1].vector[3]       = 1.0f;
+        /* In production the vectors are trained from real tile data */
 
         g_table->version = 1;
         printf("warp-room: created fresh shared memory (version 1)\n");
