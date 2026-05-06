@@ -7,7 +7,10 @@
 /* ---- Room profiles ---- */
 
 #define NUM_ROOMS    4
-#define VOCAB_DIM    97  /* unigrams + bigrams */
+#define VOCAB_DIM    97   /* unigrams + bigrams (kept for text features) */
+
+/* P48: 8 components per uint64. We use ceiling(VOCAB_DIM/8) = 13 vectors */
+#define P48_DIMS    13    /* 13 × 8 = 104 components, 97 used, 7 spare */
 
 /* Room IDs */
 enum room_id {
@@ -17,11 +20,11 @@ enum room_id {
     ROOM_JC1      = 3,
 };
 
-/* A room's profile: vector + handler */
+/* A room's profile: P48-encoded + handler */
 struct room {
     enum room_id id;
     char         name[32];
-    float        vector[VOCAB_DIM]; /* normalized feature vector */
+    uint64_t     vector[P48_DIMS];  /* P48 exact encoding, not floats */
     void         (*handler)(const char *query, char *reply, size_t rlen);
 };
 
@@ -38,10 +41,12 @@ void        wr_train(const char *text, enum room_id room);
 enum room_id wr_classify(const char *text, float *confidence);
 void        wr_stats(void);         /* print to stdout */
 
+/* ---- P48 exact classification ---- */
+enum room_id wr_classify_p48(const char *text, int *exact_dist);
+
 /* ---- NEON SIMD dispatch (when compiled for ARM64) ---- */
 #ifdef __aarch64__
-float      wr_dot_neon(const float *a, const float *b, int n);
-enum room_id wr_classify_neon(const float *vec);
+enum room_id wr_classify_p48_neon(const char *text);
 #endif
 
 #endif /* WARP_ROOM_H */

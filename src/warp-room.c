@@ -1,4 +1,4 @@
-/* warp-room.c — Subroutine-threaded tile classifier */
+/* warp-room.c — Subroutine-threaded tile classifier with P48 exact encoding */
 #define _GNU_SOURCE
 #include "warp-room.h"
 #include <stdio.h>
@@ -9,50 +9,189 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <inttypes.h>
+#include <ctype.h>
 
 /* ---- Shared memory segment ---- */
 static struct room_table *g_table = NULL;
 static int g_shm_fd = -1;
 
-/* ---- Bag-of-features extraction ---- */
-static void text_features(const char *text, float *vec) {
-    /* Simplified: counts keyword occurrences, sqrt-weighted */
-    memset(vec, 0, VOCAB_DIM * sizeof(float));
-    /* Keyword-to-index mapping would go here */
-    /* For now: placeholder counting */
-    (void)text;
+/* ---- P48 inline helpers ---- */
+static void float_to_p48_component(float val, int index, uint64_t *vec) {
+    int v = (int)(val * 63.0f + 0.5f);
+    if (v < 0) v = 0;
+    if (v > 63) v = 63;
+    int vec_idx = index / 8;
+    int bit_off = (index % 8) * 6;
+    vec[vec_idx] &= ~((uint64_t)0x3F << bit_off);
+    vec[vec_idx] |= ((uint64_t)v & 0x3F) << bit_off;
 }
 
-/* ---- Training: online learning via EMA ---- */
+static inline int p48_dot(const uint64_t *a, const uint64_t *b, int n) {
+    int sum = 0;
+    for (int v = 0; v < n; v++) {
+        uint64_t pa = a[v], pb = b[v];
+        for (int i = 0; i < 8; i++) {
+            int ca = (pa >> (6 * i)) & 0x3F;
+            int cb = (pb >> (6 * i)) & 0x3F;
+            sum += ca * cb;
+        }
+    }
+    return sum;
+}
+
+static inline int p48_dist_sq(const uint64_t *a, const uint64_t *b, int n) {
+    int sum = 0;
+    for (int v = 0; v < n; v++) {
+        uint64_t pa = a[v], pb = b[v];
+        for (int i = 0; i < 8; i++) {
+            int ca = (pa >> (6 * i)) & 0x3F;
+            int cb = (pb >> (6 * i)) & 0x3F;
+            int d = ca - cb;
+            sum += d * d;
+        }
+    }
+    return sum;
+}
+
+/* ---- Bag-of-features extraction with real keywords ---- */
+
+/* Keyword-to-index mapping: ~90 keywords, each gets a dimension */
+/* Edge keywords (indices 0-25) */
+static const char *edge_kw[] = {
+    "jetson", "cpu", "gpu", "memory", "temperature", "load", "uptime",
+    "disk", "thermal", "fan", "power", "nvidia", "cuda", "nvcc",
+    "arm64", "aarch64", "swap", "network", "interface", "sensor",
+    "telemetry", "hardware", "clock", "throttle", "edge", "device"
+};
+#define EDGE_KW_COUNT 26
+
+/* Research keywords (indices 26-52) */
+static const char *research_kw[] = {
+    "research", "paper", "study", "findings", "analysis", "experiment",
+    "benchmark", "performance", "test", "comparison", "evaluation",
+    "learn", "training", "dataset", "model", "inference", "llm",
+    "neural", "embedding", "vector", "similarity", "tile",
+    "investigation", "methodology", "result", "conclusion", "algorithm"
+};
+#define RESEARCH_KW_COUNT 27
+
+/* Fleet keywords (indices 53-76) */
+static const char *fleet_kw[] = {
+    "fleet", "agent", "oracle", "forge", "vessel", "bottle", "matrix",
+    "heartbeat", "sync", "mesh", "iron", "coordination", "bridge",
+    "pki", "cert", "trust", "deadman", "migration", "protocol",
+    "lighthouse", "beacon", "dm", "conduit", "message"
+};
+#define FLEET_KW_COUNT 24
+
+/* JC1 keywords (indices 77-89) */
+static const char *jc1_kw[] = {
+    "jc1", "jetsonclaw", "plato", "evennia", "flato", "mythos",
+    "cocapn", "libllama", "gguf", "sovereign", "infer", "think", "vessel"
+};
+#define JC1_KW_COUNT 13
+
+/* Total = 26 + 27 + 24 + 13 = 90 (within VOCAB_DIM = 97) */
+#define TOTAL_KW_COUNT (EDGE_KW_COUNT + RESEARCH_KW_COUNT + FLEET_KW_COUNT + JC1_KW_COUNT)
+
+static int keyword_index(const char *word) {
+    /* Linear search through keyword lists */
+    for (int i = 0; i < EDGE_KW_COUNT; i++)
+        if (strcmp(word, edge_kw[i]) == 0) return i;
+    for (int i = 0; i < RESEARCH_KW_COUNT; i++)
+        if (strcmp(word, research_kw[i]) == 0) return EDGE_KW_COUNT + i;
+    for (int i = 0; i < FLEET_KW_COUNT; i++)
+        if (strcmp(word, fleet_kw[i]) == 0) return EDGE_KW_COUNT + RESEARCH_KW_COUNT + i;
+    for (int i = 0; i < JC1_KW_COUNT; i++)
+        if (strcmp(word, jc1_kw[i]) == 0)
+            return EDGE_KW_COUNT + RESEARCH_KW_COUNT + FLEET_KW_COUNT + i;
+    return -1;
+}
+
+static void text_features(const char *text, float *vec) {
+    memset(vec, 0, VOCAB_DIM * sizeof(float));
+
+    if (!text || !*text) return;
+
+    /* Tokenize: split on whitespace and punctuation */
+    char *buf = strdup(text);
+    if (!buf) return;
+
+    /* Collect term frequencies */
+    int tf[VOCAB_DIM] = {0};
+    int total_terms = 0;
+
+    char *tok = strtok(buf, " \t\n\r.,!?;:\"'()[]{}<>/\\-@#$%^&*+=~`|");
+    while (tok) {
+        /* Lowercase */
+        for (char *p = tok; *p; p++) *p = tolower((unsigned char)*p);
+        int idx = keyword_index(tok);
+        if (idx >= 0 && idx < VOCAB_DIM) {
+            tf[idx]++;
+            total_terms++;
+        }
+        tok = strtok(NULL, " \t\n\r.,!?;:\"'()[]{}<>/\\-@#$%^&*+=~`|");
+    }
+    free(buf);
+
+    if (total_terms == 0) return;
+
+    /* TF weighting: log-normalized */
+    const float idf = 1.0f; /* Placeholder — we'd compute from corpus */
+    for (int i = 0; i < VOCAB_DIM; i++) {
+        if (tf[i] > 0) {
+            vec[i] = (1.0f + logf((float)tf[i])) * idf;
+        }
+    }
+}
+
+/* ---- Training: online learning via EMA, stored as P48 ---- */
 void wr_train(const char *text, enum room_id room) {
     if (!g_table || room >= NUM_ROOMS) return;
-    float vec[VOCAB_DIM];
-    text_features(text, vec);
+    float fvec[VOCAB_DIM];
+    text_features(text, fvec);
 
-    /* Normalize */
     float norm = 0.0f;
-    for (int i = 0; i < VOCAB_DIM; i++) norm += vec[i] * vec[i];
+    for (int i = 0; i < VOCAB_DIM; i++) norm += fvec[i] * fvec[i];
     if (norm < 1e-8f) return;
     norm = sqrtf(norm);
-    for (int i = 0; i < VOCAB_DIM; i++) vec[i] /= norm;
+    for (int i = 0; i < VOCAB_DIM; i++) fvec[i] /= norm;
 
-    /* EMA update to room vector */
-    const float lr = 0.3f;
+    /* Decode current P48 back to float for EMA */
+    float current[VOCAB_DIM] = {0};
     struct room *r = &g_table->rooms[room];
-    for (int i = 0; i < VOCAB_DIM; i++)
-        r->vector[i] = (1.0f - lr) * r->vector[i] + lr * vec[i];
+    for (int v = 0; v < P48_DIMS; v++) {
+        uint64_t p = r->vector[v];
+        for (int i = 0; i < 8; i++) {
+            int idx = v * 8 + i;
+            if (idx >= VOCAB_DIM) break;
+            current[idx] = (p >> (6 * i)) & 0x3F;
+            current[idx] /= 63.0f;
+        }
+    }
 
-    /* Re-normalize */
+    /* EMA update in float space */
+    const float lr = 0.3f;
+    float updated[VOCAB_DIM];
+    for (int i = 0; i < VOCAB_DIM; i++)
+        updated[i] = (1.0f - lr) * current[i] + lr * fvec[i];
+
     norm = 0.0f;
-    for (int i = 0; i < VOCAB_DIM; i++) norm += r->vector[i] * r->vector[i];
+    for (int i = 0; i < VOCAB_DIM; i++) norm += updated[i] * updated[i];
     norm = sqrtf(norm);
     if (norm > 1e-8f)
-        for (int i = 0; i < VOCAB_DIM; i++) r->vector[i] /= norm;
+        for (int i = 0; i < VOCAB_DIM; i++) updated[i] /= norm;
+
+    /* Quantize back to P48 */
+    memset(r->vector, 0, P48_DIMS * sizeof(uint64_t));
+    for (int i = 0; i < VOCAB_DIM; i++)
+        float_to_p48_component(updated[i], i, r->vector);
 
     __sync_fetch_and_add(&g_table->version, 1);
 }
 
-/* ---- Classification ---- */
+/* ---- Float-based classification (legacy) ---- */
 enum room_id wr_classify(const char *text, float *confidence) {
     if (!g_table) return ROOM_EDGE;
 
@@ -67,16 +206,58 @@ enum room_id wr_classify(const char *text, float *confidence) {
 
     enum room_id best = ROOM_EDGE;
     float best_score = -1.0f;
-    for (int i = 0; i < NUM_ROOMS; i++) {
+    for (int ri = 0; ri < NUM_ROOMS; ri++) {
+        float current[VOCAB_DIM] = {0};
+        for (int v = 0; v < P48_DIMS; v++) {
+            uint64_t p = g_table->rooms[ri].vector[v];
+            for (int i = 0; i < 8; i++) {
+                int idx = v * 8 + i;
+                if (idx >= VOCAB_DIM) break;
+                current[idx] = (p >> (6 * i)) & 0x3F;
+                current[idx] /= 63.0f;
+            }
+        }
         float dot = 0.0f;
         for (int j = 0; j < VOCAB_DIM; j++)
-            dot += vec[j] * g_table->rooms[i].vector[j];
+            dot += vec[j] * current[j];
         if (dot > best_score) {
             best_score = dot;
-            best = (enum room_id)i;
+            best = (enum room_id)ri;
         }
     }
     if (confidence) *confidence = best_score;
+    return best;
+}
+
+/* ---- P48 exact classification ---- */
+enum room_id wr_classify_p48(const char *text, int *exact_dist) {
+    if (!g_table) return ROOM_EDGE;
+
+    float fvec[VOCAB_DIM];
+    text_features(text, fvec);
+
+    float norm = 0.0f;
+    for (int i = 0; i < VOCAB_DIM; i++) norm += fvec[i] * fvec[i];
+    if (norm < 1e-8f) return ROOM_EDGE;
+    norm = sqrtf(norm);
+    for (int i = 0; i < VOCAB_DIM; i++) fvec[i] /= norm;
+
+    /* Quantize to P48 */
+    uint64_t qvec[P48_DIMS] = {0};
+    for (int i = 0; i < VOCAB_DIM; i++)
+        float_to_p48_component(fvec[i], i, qvec);
+
+    /* Exact integer nearest-neighbor */
+    enum room_id best = ROOM_EDGE;
+    int best_dist = INT32_MAX;
+    for (int ri = 0; ri < NUM_ROOMS; ri++) {
+        int d = p48_dist_sq(qvec, g_table->rooms[ri].vector, P48_DIMS);
+        if (d < best_dist) {
+            best_dist = d;
+            best = (enum room_id)ri;
+        }
+    }
+    if (exact_dist) *exact_dist = best_dist;
     return best;
 }
 
@@ -90,7 +271,6 @@ void wr_init(void) {
                    PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0);
     if (g_table == MAP_FAILED) { perror("mmap"); g_table = NULL; return; }
 
-    /* Initialize if fresh (version == 0) */
     if (g_table->version == 0) {
         g_table->num_rooms = NUM_ROOMS;
 
@@ -99,17 +279,54 @@ void wr_init(void) {
         strcpy(g_table->rooms[ROOM_FLEET].name,    "fleet");
         strcpy(g_table->rooms[ROOM_JC1].name,      "jc1");
 
-        /* Seed with keyword vectors from the Python prototype */
-        /* For each room, we set a single known keyword at 1.0 so
-           --infer with matching text produces a real classification */
-        g_table->rooms[ROOM_EDGE].vector[0]     = 1.0f;
-        g_table->rooms[ROOM_RESEARCH].vector[1]  = 1.0f;
-        g_table->rooms[ROOM_FLEET].vector[2]     = 1.0f;
-        g_table->rooms[ROOM_JC1].vector[3]       = 1.0f;
-        /* In production the vectors are trained from real tile data */
+        /* Seed with keyword vectors, L2-normalized (same normalization as wr_train) */
+        {
+            float fvec[VOCAB_DIM];
+            float norm;
+
+            /* Edge: high weight on tokens 0-25 */
+            memset(fvec, 0, sizeof(fvec));
+            for (int i = 0; i < EDGE_KW_COUNT; i++) fvec[i] = 1.0f;
+            norm = 0.0f;
+            for (int i = 0; i < VOCAB_DIM; i++) norm += fvec[i] * fvec[i];
+            norm = sqrtf(norm);
+            for (int i = 0; i < VOCAB_DIM; i++) fvec[i] /= norm;
+            for (int i = 0; i < VOCAB_DIM; i++)
+                float_to_p48_component(fvec[i], i, g_table->rooms[ROOM_EDGE].vector);
+
+            /* Research: high weight on tokens 26-52 */
+            memset(fvec, 0, sizeof(fvec));
+            for (int i = 0; i < RESEARCH_KW_COUNT; i++) fvec[EDGE_KW_COUNT + i] = 1.0f;
+            norm = 0.0f;
+            for (int i = 0; i < VOCAB_DIM; i++) norm += fvec[i] * fvec[i];
+            norm = sqrtf(norm);
+            for (int i = 0; i < VOCAB_DIM; i++) fvec[i] /= norm;
+            for (int i = 0; i < VOCAB_DIM; i++)
+                float_to_p48_component(fvec[i], i, g_table->rooms[ROOM_RESEARCH].vector);
+
+            /* Fleet: high weight on tokens 53-76 */
+            memset(fvec, 0, sizeof(fvec));
+            for (int i = 0; i < FLEET_KW_COUNT; i++) fvec[EDGE_KW_COUNT + RESEARCH_KW_COUNT + i] = 1.0f;
+            norm = 0.0f;
+            for (int i = 0; i < VOCAB_DIM; i++) norm += fvec[i] * fvec[i];
+            norm = sqrtf(norm);
+            for (int i = 0; i < VOCAB_DIM; i++) fvec[i] /= norm;
+            for (int i = 0; i < VOCAB_DIM; i++)
+                float_to_p48_component(fvec[i], i, g_table->rooms[ROOM_FLEET].vector);
+
+            /* JC1: high weight on tokens 77-89 */
+            memset(fvec, 0, sizeof(fvec));
+            for (int i = 0; i < JC1_KW_COUNT; i++) fvec[EDGE_KW_COUNT + RESEARCH_KW_COUNT + FLEET_KW_COUNT + i] = 1.0f;
+            norm = 0.0f;
+            for (int i = 0; i < VOCAB_DIM; i++) norm += fvec[i] * fvec[i];
+            norm = sqrtf(norm);
+            for (int i = 0; i < VOCAB_DIM; i++) fvec[i] /= norm;
+            for (int i = 0; i < VOCAB_DIM; i++)
+                float_to_p48_component(fvec[i], i, g_table->rooms[ROOM_JC1].vector);
+        }
 
         g_table->version = 1;
-        printf("warp-room: created fresh shared memory (version 1)\n");
+        printf("warp-room: created fresh P48 shared memory (version 1)\n");
     } else {
         printf("warp-room: attached to existing shared memory (version %u)\n",
                g_table->version);
@@ -122,12 +339,16 @@ int main(int argc, char **argv) {
     wr_init();
 
     if (argc >= 3 && strcmp(argv[1], "--infer") == 0) {
-        float conf;
+        float conf = 0.0f;
         enum room_id r = wr_classify(argv[2], &conf);
         printf("{\"room\": \"%s\", \"confidence\": %.4f}\n",
                g_table ? g_table->rooms[r].name : "unknown", conf);
+    } else if (argc >= 3 && strcmp(argv[1], "--infer-p48") == 0) {
+        int dist;
+        enum room_id r = wr_classify_p48(argv[2], &dist);
+        printf("{\"room\": \"%s\", \"exact_distance\": %d}\n",
+               g_table ? g_table->rooms[r].name : "unknown", dist);
     } else if (argc >= 3 && strcmp(argv[1], "--train") == 0) {
-        /* Usage: --train <text> <room_name> */
         if (argc < 4) { fprintf(stderr, "usage: --train <text> <room>\n"); return 1; }
         enum room_id id = ROOM_EDGE;
         for (int i = 0; i < NUM_ROOMS; i++)
@@ -135,7 +356,10 @@ int main(int argc, char **argv) {
         wr_train(argv[2], id);
         printf("trained on room %s\n", argv[3]);
     } else {
-        printf("Usage: warp-room --infer <text> | --train <text> <room>\n");
+        printf("Usage:\n");
+        printf("  warp-room --infer <text>     (float cosine similarity)\n");
+        printf("  warp-room --infer-p48 <text> (P48 exact integer distance)\n");
+        printf("  warp-room --train <text> <room>\n");
     }
     return 0;
 }
